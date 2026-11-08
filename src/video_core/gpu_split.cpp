@@ -375,6 +375,61 @@ bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
     return true;
 }
 
+bool GpuSplit::OverlayQueuedWritesSkippingReports(u64 since, u64 begin, u32* out, u32 words) {
+    if ((begin & 3) != 0) {
+        return false;
+    }
+    const u64 end = begin + u64{words} * sizeof(u32);
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    // Newest first, back to what the back had consumed before guest memory was read.
+    std::array<u32, 64> overlapping;
+    u32 found = 0;
+    u64 scanned = 0;
+    for (; scanned < remembered; ++scanned) {
+        const u64 index = (pending_write_count - 1 - scanned) % pending_writes.size();
+        const PendingWrite& write = pending_writes[index];
+        if (write.position <= since) {
+            break;
+        }
+        if (write.begin < end && begin < write.end && write.words == 0 && write.what != nullptr &&
+            std::strcmp(write.what, "3D report") == 0) {
+            continue;
+        }
+        if (write.begin < end && begin < write.end) {
+            if (write.words == 0 || (write.begin & 3) != 0 || found == overlapping.size()) {
+                // EDEN_NX2_OVERLAY_TRACE: which queued writes keep reads waiting.
+                static const bool trace = std::getenv("EDEN_NX2_OVERLAY_TRACE") != nullptr;
+                static std::atomic<u32> traced{};
+                if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 48) {
+                    LOG_INFO(HW_GPU, "overlay: read {:#x}+{} blocked by {} write {:#x}-{:#x}",
+                             begin, words * 4, write.what, write.begin, write.end);
+                }
+                return false;
+            }
+            overlapping[found++] = static_cast<u32>(index);
+        }
+    }
+    if (scanned == pending_writes.size()) {
+        static const bool trace = std::getenv("EDEN_NX2_OVERLAY_TRACE") != nullptr;
+        static std::atomic<u32> traced{};
+        if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_INFO(HW_GPU, "overlay: read {:#x} with over {} queued writes", begin,
+                     pending_writes.size());
+        }
+        return false;
+    }
+    for (u32 i = found; i-- > 0;) {
+        const PendingWrite& write = pending_writes[overlapping[i]];
+        for (u32 w = 0; w < write.words; ++w) {
+            const u64 address = write.begin + u64{w} * sizeof(u32);
+            if (address >= begin && address < end) {
+                out[(address - begin) / sizeof(u32)] = write.data[w];
+            }
+        }
+    }
+    return true;
+}
+
 bool GpuSplit::WaitForSync() {
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
 }

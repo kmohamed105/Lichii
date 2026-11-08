@@ -1860,6 +1860,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             const u64 first_page = *device >> 12;
             const u64 last_page = (*device + read_bytes - 1) >> 12;
             bool hit = true;
+            bool stale = false;
+            const u64 consumed_before_read = split.ConsumedNow();
             for (u64 page = first_page; page <= last_page && hit; ++page) {
                 const auto it = fs.dma_snapshots.find(page);
                 hit = it != fs.dma_snapshots.end() &&
@@ -1867,6 +1869,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 if (!hit && it != fs.dma_snapshots.end() && stale_reports &&
                     split.OnlyReportsWrittenSince(it->second, *device, read_bytes)) {
                     hit = true;
+                    stale = true;
                     ++stale_reads;
                 } else if (!hit) {
                     if (it != fs.dma_snapshots.end()) {
@@ -1885,9 +1888,22 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             if (!hit || !rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12)) {
                 thread_local std::vector<u32> snap_words;
                 snap_words.resize(words);
+                if (hit && stale &&
+                    ((*device & 3) != 0 ||
+                     ([&] {
+                         memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
+                         return !split.OverlayQueuedWritesSkippingReports(
+                             consumed_before_read, *device, snap_words.data(), words);
+                     }()))) {
+                    // Known words could not be overlaid: wait as before.
+                    hit = false;
+                    --stale_reads;
+                }
                 if (hit) {
                     ++hits;
-                    memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
+                    if (!stale) {
+                        memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
+                    }
                     if (snapshot_mode == 10) {
                         split.Drain(VideoCommon::DrainSite::MacroDmaRead);
                         flush_if_dirty();

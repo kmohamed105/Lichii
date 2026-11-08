@@ -367,9 +367,9 @@ public:
             if (write.position <= since) {
                 return true;
             }
-            if (write.begin < end && begin < write.end &&
+            if (write.begin < end && begin < write.end && write.words == 0 &&
                 (write.what == nullptr || std::strcmp(write.what, "3D report") != 0)) {
-                return false;
+                return false; // Unknown contents other than a report (known words are overlaid)
             }
         }
         return remembered != pending_writes.size();
@@ -409,6 +409,9 @@ public:
     /// `since` = ConsumedNow()) the queued writes the front knows the words of. False when an
     /// overlapping queued write's words are unknown (the caller waits instead).
     bool OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words);
+    /// As OverlayQueuedWrites, for EDEN_NX2_STALE_REPORT_READS: queued 3D reports are skipped
+    /// (the earlier result stays) instead of making the read wait.
+    bool OverlayQueuedWritesSkippingReports(u64 since, u64 begin, u32* out, u32 words);
     /// Waits until the back executed the noted writes that overlap [begin, begin + size).
     /// Returns false when more writes are queued than are remembered (the caller drains).
     bool WaitForWritesTo(u64 begin, u64 size);
