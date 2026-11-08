@@ -703,7 +703,8 @@ public:
 
     Image(Image&& rhs) noexcept
         : handle{std::exchange(rhs.handle, VkImage{})}, usage{rhs.usage}, owner{rhs.owner},
-          allocator{rhs.allocator}, allocation{rhs.allocation}, dld{rhs.dld} {}
+          allocator{rhs.allocator}, allocation{rhs.allocation}, dld{rhs.dld},
+          recycle_key{std::exchange(rhs.recycle_key, u64{})} {}
 
     Image& operator=(Image&& rhs) noexcept {
         Release();
@@ -713,7 +714,17 @@ public:
         allocator = rhs.allocator;
         allocation = rhs.allocation;
         dld = rhs.dld;
+        recycle_key = std::exchange(rhs.recycle_key, u64{});
         return *this;
+    }
+
+    /// EDEN_NX2_RECYCLE_IMAGES: on release, an image with a recycle key is offered to the
+    /// recycler (MemoryAllocator), which keeps it, memory bound, for the next image created with
+    /// the same parameters instead of the driver destroying it.
+    using Recycler = bool (*)(u64 key, VkImage image, VmaAllocation allocation) noexcept;
+    static inline Recycler recycler = nullptr;
+    void SetRecycleKey(u64 key) noexcept {
+        recycle_key = key;
     }
 
     ~Image() noexcept {
@@ -727,6 +738,7 @@ public:
     void reset() noexcept {
         Release();
         handle = VkImage{};
+        recycle_key = 0;
     }
 
     explicit operator bool() const noexcept {
@@ -757,6 +769,7 @@ private:
     VmaAllocator allocator = nullptr;
     VmaAllocation allocation = nullptr;
     const DeviceDispatch* dld = nullptr;
+    u64 recycle_key{};
 };
 
 struct MemoryLocation {

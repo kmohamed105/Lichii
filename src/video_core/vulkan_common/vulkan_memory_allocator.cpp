@@ -7,7 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <unordered_map>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -204,7 +208,157 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
     }
 }
 
-MemoryAllocator::~MemoryAllocator() = default;
+
+namespace {
+// EDEN_NX2_RECYCLE_IMAGES=<MiB>: render targets the texture cache collects are kept (up to that
+// much memory, 1024 MiB when the value is under 64) and handed out again when an image with the
+// same parameters is created. Ocarina of Time recreates its post-processing targets at new
+// addresses about every frame while the camera moves (~350 images a second): each one otherwise
+// costs vkCreateImage, memory binding, and on release vkDestroyImage with the driver freeing its
+// GPU virtual addresses (~8% of the GPU back thread). A reused image starts in an undefined
+// layout like a new one; the texture cache transitions it from VK_IMAGE_LAYOUT_UNDEFINED.
+struct ImageRecycling {
+    struct Entry {
+        VkImage image;
+        VmaAllocation allocation;
+        VkDeviceSize size;
+        u64 sequence; ///< When it was kept: the oldest go first when the cap is reached
+    };
+    std::mutex mutex;
+    VmaAllocator allocator{};
+    std::map<std::vector<u64>, u64> ids;
+    std::unordered_map<u64, std::vector<Entry>> free;
+    VkDeviceSize held{};
+    VkDeviceSize cap{};
+    u64 hits{};
+    u64 misses{};
+    u64 kept{};
+    u64 over_cap{};
+    u64 drains{};
+    u64 evicted{};
+    u64 sequence{};
+    bool enabled{};
+};
+
+ImageRecycling& Recycling() {
+    static ImageRecycling recycling;
+    return recycling;
+}
+
+VkDeviceSize RecycleCap() {
+    static const VkDeviceSize cap = [] {
+        const char* const value = std::getenv("EDEN_NX2_RECYCLE_IMAGES");
+        if (value == nullptr) {
+            return VkDeviceSize{0};
+        }
+        long long mib = std::atoll(value);
+        if (mib < 64) {
+            mib = 1024;
+        }
+        return static_cast<VkDeviceSize>(mib) << 20;
+    }();
+    return cap;
+}
+
+bool KeepImage(u64 key, VkImage image, VmaAllocation allocation) noexcept {
+    ImageRecycling& r = Recycling();
+    std::scoped_lock lock{r.mutex};
+    if (!r.enabled) {
+        return false;
+    }
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(r.allocator, allocation, &info);
+    if (info.size > r.cap / 4) {
+        ++r.over_cap;
+        return false;
+    }
+    // Make room by destroying the images kept longest: the game moves on to other shapes
+    // (thousands over a few minutes), and those it stopped using must not fill the cap.
+    while (r.held + info.size > r.cap) {
+        auto oldest = r.free.end();
+        for (auto it = r.free.begin(); it != r.free.end(); ++it) {
+            if (oldest == r.free.end() || it->second.front().sequence < oldest->second.front().sequence) {
+                oldest = it;
+            }
+        }
+        if (oldest == r.free.end()) {
+            break;
+        }
+        const ImageRecycling::Entry victim = oldest->second.front();
+        oldest->second.erase(oldest->second.begin());
+        if (oldest->second.empty()) {
+            r.free.erase(oldest);
+        }
+        vmaDestroyImage(r.allocator, victim.image, victim.allocation);
+        r.held -= victim.size;
+        ++r.evicted;
+    }
+    try {
+        r.free[key].push_back({image, allocation, info.size, ++r.sequence});
+    } catch (...) {
+        return false;
+    }
+    r.held += info.size;
+    ++r.kept;
+    return true;
+}
+
+/// Destroys every image kept for reuse. Caller holds the mutex.
+void DrainRecycled(ImageRecycling& r) {
+    for (auto& [key, entries] : r.free) {
+        for (const ImageRecycling::Entry& entry : entries) {
+            vmaDestroyImage(r.allocator, entry.image, entry.allocation);
+        }
+    }
+    r.free.clear();
+    r.held = 0;
+}
+
+/// The parameters an image must match to be reused, or empty when it is not a candidate.
+std::vector<u64> RecycleDescriptor(const VkImageCreateInfo& ci) {
+    constexpr VkImageUsageFlags attachment_usage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    constexpr VkImageCreateFlags sparse_flags = VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                                                VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                                                VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+    if ((ci.usage & attachment_usage) == 0 || (ci.flags & sparse_flags) != 0 ||
+        ci.imageType != VK_IMAGE_TYPE_2D || ci.mipLevels != 1 || ci.arrayLayers != 1 ||
+        ci.tiling != VK_IMAGE_TILING_OPTIMAL || ci.sharingMode != VK_SHARING_MODE_EXCLUSIVE) {
+        return {};
+    }
+    std::vector<u64> desc{
+        u64{ci.flags},
+        u64{static_cast<u32>(ci.format)},
+        (u64{ci.extent.width} << 32) | ci.extent.height,
+        u64{ci.extent.depth},
+        u64{static_cast<u32>(ci.samples)},
+        u64{ci.usage},
+        u64{static_cast<u32>(ci.initialLayout)},
+    };
+    for (const VkBaseInStructure* next = static_cast<const VkBaseInStructure*>(ci.pNext);
+         next != nullptr; next = next->pNext) {
+        if (next->sType != VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+            return {};
+        }
+        const auto* list = reinterpret_cast<const VkImageFormatListCreateInfo*>(next);
+        desc.push_back(0xF0F0F0F0ull + list->viewFormatCount);
+        for (u32 i = 0; i < list->viewFormatCount; ++i) {
+            desc.push_back(static_cast<u32>(list->pViewFormats[i]));
+        }
+    }
+    return desc;
+}
+} // Anonymous namespace
+
+MemoryAllocator::~MemoryAllocator() {
+    ImageRecycling& r = Recycling();
+    std::scoped_lock lock{r.mutex};
+    if (r.enabled && r.allocator == allocator) {
+        DrainRecycled(r);
+        r.enabled = false;
+        vk::Image::recycler = nullptr;
+    }
+}
 
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
@@ -227,6 +381,50 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     VkImage handle{};
     VmaAllocation allocation{};
     VmaAllocationInfo alloc_info{};
+    u64 recycle_key = 0;
+    if (const VkDeviceSize recycle_cap = RecycleCap(); recycle_cap != 0 && !dedicated &&
+        u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers <=
+            (u64{1} << 28)) {
+        std::vector<u64> desc = RecycleDescriptor(ci);
+        if (!desc.empty()) {
+            ImageRecycling& r = Recycling();
+            std::scoped_lock lock{r.mutex};
+            if (!r.enabled) {
+                r.enabled = true;
+                r.allocator = allocator;
+                r.cap = recycle_cap;
+                vk::Image::recycler = &KeepImage;
+                LOG_INFO(Render_Vulkan, "Render targets are recycled (up to {} MiB kept)",
+                         recycle_cap >> 20);
+            }
+            if (r.allocator == allocator) {
+                const u64 next_id = r.ids.size() + 1;
+                recycle_key = r.ids.try_emplace(std::move(desc), next_id).first->second;
+                const auto found = r.free.find(recycle_key);
+                const bool hit = found != r.free.end() && !found->second.empty();
+                ++(hit ? r.hits : r.misses);
+                if ((r.hits + r.misses) % 8192 == 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "Image recycling: {} reused, {} created, {} kept, {} oldest destroyed, "
+                             "{} too big, {} drains, {} MiB held, {} shapes",
+                             r.hits, r.misses, r.kept, r.evicted, r.over_cap, r.drains,
+                             r.held >> 20, r.ids.size());
+                }
+                if (hit) {
+                    const ImageRecycling::Entry entry = found->second.back();
+                    found->second.pop_back();
+                    if (found->second.empty()) {
+                        r.free.erase(found);
+                    }
+                    r.held -= entry.size;
+                    vk::Image image(entry.image, ci.usage, *device.GetLogical(), allocator,
+                                    entry.allocation, device.GetDispatchLoader());
+                    image.SetRecycleKey(recycle_key);
+                    return image;
+                }
+            }
+        }
+    }
     // Images this large (title 1's sparse texture arrays reach 4.5G texels, ~23 GB) are never
     // backed: VMA would quietly place them in system memory once VRAM is full. They take the
     // unbacked sparse fallback below.
@@ -264,6 +462,20 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     VkResult result = pooled ? VK_SUCCESS
                       : huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                              : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge && recycle_key != 0) {
+        // Over the budget: give back the memory of the images kept for reuse first.
+        {
+            ImageRecycling& r = Recycling();
+            std::scoped_lock lock{r.mutex};
+            if (r.held != 0) {
+                DrainRecycled(r);
+                ++r.drains;
+            }
+        }
+        result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    }
+    // Only images in device memory within the budget are kept for reuse.
+    const bool recyclable = result == VK_SUCCESS;
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
@@ -330,8 +542,12 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
         );
     }
 
-    return vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
-                        device.GetDispatchLoader());
+    vk::Image image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
+                    device.GetDispatchLoader());
+    if (recyclable && recycle_key != 0) {
+        image.SetRecycleKey(recycle_key);
+    }
+    return image;
 }
 
 vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased) const {
