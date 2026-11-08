@@ -309,6 +309,11 @@ public:
         if (last_memory_writer_position <= since) {
             return false;
         }
+        if (write_index_enabled &&
+            !IndexedSince(write_index, huge_write_position, since, begin, size)) {
+            return false; // The index never answers "not written" wrongly
+        }
+        // Possibly written (or no index): the ring of noted writes tells exactly.
         const u64 end = begin + size;
         const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
         for (u64 scanned = 0; scanned < remembered; ++scanned) {
@@ -359,6 +364,10 @@ public:
         if (writer_position > since || last_unranged_position > since) {
             return false;
         }
+        if (write_index_enabled &&
+            !IndexedSince(other_index, huge_other_position, since, begin, size)) {
+            return true;
+        }
         const u64 end = begin + size;
         const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
         for (u64 scanned = 0; scanned < remembered; ++scanned) {
@@ -377,6 +386,7 @@ public:
     /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
     /// report, a semaphore release). size ~0 means an unknown range.
     void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {
+        IndexWrite(begin, size, what == nullptr || std::strcmp(what, "3D report") != 0);
         PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
         write.what = what;
         write.begin = begin;
@@ -387,6 +397,7 @@ public:
     /// As NoteMemoryWrite, for a write whose words the front knows (a fence release payload,
     /// linear inline upload data): reads overlay them instead of waiting.
     void NoteMemoryWriteData(u64 begin, const u32* data, u32 words) {
+        IndexWrite(begin, u64{words} * sizeof(u32), false);
         while (words != 0) {
             const u32 count = (std::min<u32>)(words, PendingWriteWords);
             PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
@@ -613,6 +624,57 @@ private:
     };
     std::array<PendingWrite, 8192> pending_writes{};
     u64 pending_write_count{};
+
+    // EDEN_NX2_WRITE_INDEX: the newest position of a noted write per 4 KiB device page, in a
+    // hashed table where pages sharing a slot share the newest of their positions (a lookup
+    // never answers older than the truth: at worst a read waits needlessly). Replaces scanning
+    // the ring of noted writes on every macro DMA read (~5% of the front thread once copies,
+    // 2D and uploads note ranges). other_index: writes of unknown contents other than reports.
+    static constexpr u32 WriteIndexBits = 20;
+    static constexpr u64 WriteIndexHugePages = 1024; ///< Larger writes count for every page
+    static inline const bool write_index_enabled = std::getenv("EDEN_NX2_WRITE_INDEX") != nullptr;
+    std::vector<u64> write_index = std::vector<u64>(size_t{1} << WriteIndexBits);
+    std::vector<u64> other_index = std::vector<u64>(size_t{1} << WriteIndexBits);
+    u64 huge_write_position{};
+    u64 huge_other_position{};
+    static size_t WriteIndexSlot(u64 page) {
+        return static_cast<size_t>((page * 0x9E3779B97F4A7C15ull) >> (64 - WriteIndexBits));
+    }
+    void IndexWrite(u64 begin, u64 size, bool unknown_other) {
+        if (size == 0) {
+            return;
+        }
+        const bool huge = size == ~u64{0} || (size >> 12) >= WriteIndexHugePages;
+        if (huge) {
+            huge_write_position = write_position;
+            if (unknown_other) {
+                huge_other_position = write_position;
+            }
+            return;
+        }
+        for (u64 page = begin >> 12; page <= (begin + size - 1) >> 12; ++page) {
+            const size_t slot = WriteIndexSlot(page);
+            write_index[slot] = write_position;
+            if (unknown_other) {
+                other_index[slot] = write_position;
+            }
+        }
+    }
+    static bool IndexedSince(const std::vector<u64>& index, u64 huge_position, u64 since,
+                             u64 begin, u64 size) {
+        if (huge_position > since) {
+            return true;
+        }
+        if (size == 0) {
+            return false;
+        }
+        for (u64 page = begin >> 12; page <= (begin + size - 1) >> 12; ++page) {
+            if (index[WriteIndexSlot(page)] > since) {
+                return true;
+            }
+        }
+        return false;
+    }
     u64 last_sync_position{};
     u64 last_memory_write_position{};
     static constexpr u32 DeferredWrite = ~0U;

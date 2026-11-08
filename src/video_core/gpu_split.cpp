@@ -155,6 +155,10 @@ void GpuSplit::Stop() {
     last_copy_position = 0;
     last_memory_writer_position = 0;
     pending_write_count = 0;
+    std::fill(write_index.begin(), write_index.end(), u64{0});
+    std::fill(other_index.begin(), other_index.end(), u64{0});
+    huge_write_position = 0;
+    huge_other_position = 0;
     async_writes.clear();
     last_sync_position = 0;
     last_memory_write_position = 0;
