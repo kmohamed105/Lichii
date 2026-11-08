@@ -257,12 +257,18 @@ public:
     void Drain(DrainSite site = DrainSite::Other);
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
-    void NoteWriter(bool copy = false) {
+    void NoteWriter(bool copy = false, bool ranged_copy = false) {
         last_writer_position = write_position;
         if (copy) {
             last_copy_position = write_position;
+        } else if (!ranged_copy) {
+            last_compute_position = write_position;
         }
     }
+    /// EDEN_NX2_LIST_RANGED_WAIT: before reading a GPU-written command list, wait for the last
+    /// compute dispatch and unranged copy, and for the ranged writes (copies, 2D) to the list's
+    /// bytes only, instead of for every copy sent since (WaitForWriters).
+    bool WaitForListWriters(u64 begin, u64 size);
     /// EDEN_NX2_SNAPSHOT_IGNORE_COMPUTE: compute dispatches do not end macro DMA read snapshots
     /// (copies still do). Ocarina of Time's per-object occlusion report reads missed their
     /// snapshot ~3,000 times a second because a compute dispatch had been sent since, each miss a
@@ -610,7 +616,8 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
-    u64 last_copy_position{}; ///< The last MaxwellDMA writer (a subset of last_writer_position)
+    u64 last_copy_position{};
+    u64 last_compute_position{}; ///< The last writer other than a copy (compute dispatches) ///< The last MaxwellDMA writer (a subset of last_writer_position)
     u64 last_memory_writer_position{};
     u64 last_unranged_position{};
     static constexpr u32 PendingWriteWords = 8;

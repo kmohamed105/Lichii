@@ -153,6 +153,7 @@ void GpuSplit::Stop() {
     write_position = 0;
     last_writer_position = 0;
     last_copy_position = 0;
+    last_compute_position = 0;
     last_memory_writer_position = 0;
     pending_write_count = 0;
     std::fill(write_index.begin(), write_index.end(), u64{0});
@@ -279,6 +280,29 @@ void GpuSplit::Drain(DrainSite site) {
 
 bool GpuSplit::WaitForWriters() {
     return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
+}
+
+bool GpuSplit::WaitForListWriters(u64 begin, u64 size) {
+    static const bool ranged = std::getenv("EDEN_NX2_LIST_RANGED_WAIT") != nullptr;
+    if (!ranged) {
+        return WaitForWriters();
+    }
+    static u64 narrowed{};
+    static u64 total{};
+    ++total;
+    const u64 full = (std::min)(last_writer_position, write_position);
+    const u64 target =
+        (std::min)((std::max)(last_compute_position, last_copy_position), write_position);
+    const bool waited = WaitFor(target, DrainSite::ListWriters);
+    if (!WaitForWritesTo(begin, size)) {
+        return WaitFor(full, DrainSite::ListWriters) || waited;
+    }
+    narrowed += target < full ? 1 : 0;
+    if (total % 4096 == 0) {
+        LOG_INFO(HW_GPU, "List waits: {} of {} waited less than for every writer", narrowed,
+                 total);
+    }
+    return waited;
 }
 
 bool GpuSplit::WaitForMemoryWriters() {

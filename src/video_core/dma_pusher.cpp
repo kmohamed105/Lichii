@@ -749,7 +749,7 @@ void DmaPusher::NoteCopyWrites(u32 subchannel) {
                  outcomes[0], outcomes[1], outcomes[2], outcomes[3]);
     }
     if (ranged) {
-        split.NoteWriter(false);
+        split.NoteWriter(false, true);
         split.NoteMemoryWriter();
     } else {
         split.NoteWriter(true);
@@ -1210,7 +1210,13 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     }
     auto& split = VideoCommon::GpuSplit::Get();
     if (split.Active()) {
-        split.WaitForWriters();
+        const auto first = memory_manager.GpuToCpuAddress(address);
+        const auto last = memory_manager.GpuToCpuAddress(end - 1);
+        if (first && last && *last == *first + (end - address) - 1) {
+            split.WaitForListWriters(*first, end - address);
+        } else {
+            split.WaitForWriters();
+        }
     }
     bool past_sync = !split.Active();
     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
