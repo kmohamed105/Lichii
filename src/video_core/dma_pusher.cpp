@@ -675,7 +675,7 @@ void DmaPusher::CallMethod(u32 argument) {
                                     engine_type == Engines::EngineTypes::Fermi2D);
         SCOPE_EXIT {
             if (writer) {
-                split.NoteWriter();
+                split.NoteWriter(engine_type == Engines::EngineTypes::MaxwellDMA);
             } else if (memory_writer) {
                 split.NoteUnrangedWriter();
             }
@@ -744,7 +744,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                                     engine_type == Engines::EngineTypes::Fermi2D);
         SCOPE_EXIT {
             if (writer) {
-                split.NoteWriter();
+                split.NoteWriter(engine_type == Engines::EngineTypes::MaxwellDMA);
             } else if (memory_writer) {
                 split.NoteUnrangedWriter();
             }

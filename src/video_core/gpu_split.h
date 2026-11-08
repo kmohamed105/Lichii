@@ -257,9 +257,19 @@ public:
     void Drain(DrainSite site = DrainSite::Other);
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
-    void NoteWriter() {
+    void NoteWriter(bool copy = false) {
         last_writer_position = write_position;
+        if (copy) {
+            last_copy_position = write_position;
+        }
     }
+    /// EDEN_NX2_SNAPSHOT_IGNORE_COMPUTE: compute dispatches do not end macro DMA read snapshots
+    /// (copies still do). Ocarina of Time's per-object occlusion report reads missed their
+    /// snapshot ~3,000 times a second because a compute dispatch had been sent since, each miss a
+    /// full wait for the back (~34% of the front thread); its compute work does not write the
+    /// report pages. With EDEN_NX2_DMA_SNAPSHOT=10 every read is checked against a drained one.
+    static inline const bool ignore_compute_writers =
+        std::getenv("EDEN_NX2_SNAPSHOT_IGNORE_COMPUTE") != nullptr;
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
@@ -291,7 +301,9 @@ public:
     /// [begin, begin + size): compute or copies (any range), unranged writers, or a noted write
     /// that overlaps the range. Also true when more writes were noted since than are remembered.
     [[nodiscard]] bool MayBeWrittenSince(u64 since, u64 begin, u64 size) const {
-        if (last_writer_position > since || last_unranged_position > since) {
+        const u64 writer_position =
+            ignore_compute_writers ? last_copy_position : last_writer_position;
+        if (writer_position > since || last_unranged_position > since) {
             return true;
         }
         if (last_memory_writer_position <= since) {
@@ -533,6 +545,7 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
+    u64 last_copy_position{}; ///< The last MaxwellDMA writer (a subset of last_writer_position)
     u64 last_memory_writer_position{};
     u64 last_unranged_position{};
     static constexpr u32 PendingWriteWords = 8;
