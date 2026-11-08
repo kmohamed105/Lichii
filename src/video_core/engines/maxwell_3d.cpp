@@ -1856,7 +1856,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             static std::array<u64, 4> miss_reasons{};
             static u64 stale_reads{};
             static std::map<std::string, u64> blockers; ///< What ended the snapshot of a miss
-            static const bool stale_reports = std::getenv("EDEN_NX2_STALE_REPORT_READS") != nullptr;
+            static const bool stale_reports = [] { const char* v = std::getenv("EDEN_NX2_STALE_REPORT_READS"); return v == nullptr || v[0] != '0'; }();
             const u64 first_page = *device >> 12;
             const u64 last_page = (*device + read_bytes - 1) >> 12;
             bool hit = true;

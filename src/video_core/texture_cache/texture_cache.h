@@ -162,7 +162,7 @@ void TextureCache<P>::RunGarbageCollector() {
         // EDEN_NX2_GC_NO_DOWNLOAD: evict GPU-written images without reading them back (each
         // read-back waits for the GPU to go idle). Their data is lost: guest memory keeps what
         // it held before.
-        static const bool no_download = std::getenv("EDEN_NX2_GC_NO_DOWNLOAD") != nullptr;
+        static const bool no_download = [] { const char* v = std::getenv("EDEN_NX2_GC_NO_DOWNLOAD"); return v == nullptr || v[0] != '0'; }();
         const bool downloadable =
             IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
         const bool must_download = downloadable && !no_download;
@@ -2785,7 +2785,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     const auto fresh_render_target = [&] {
         static const int mode = [] {
             const char* value = std::getenv("EDEN_NX2_RT_FRESH");
-            return value != nullptr ? std::atoi(value) : 0;
+            return value != nullptr ? std::atoi(value) : 2; // On by default (relaxed)
         }();
         if (mode == 0 || !creating_render_target || new_info.type != ImageType::e2D ||
             new_info.resources.levels != 1 || new_info.resources.layers != 1 ||

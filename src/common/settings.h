@@ -426,7 +426,7 @@ struct Values {
                                                 true,
                                                 true};
 
-    SwitchableSetting<bool> frame_gen{linkage, false, "frame_gen", Category::Renderer,
+    SwitchableSetting<bool> frame_gen{linkage, true, "frame_gen", Category::Renderer,
                                       Specialization::Default, true, false};
 
     SwitchableSetting<FrameGenType> frame_gen_type{linkage,

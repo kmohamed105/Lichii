@@ -241,7 +241,7 @@ void UnswizzleGobs(std::span<u8> output, std::span<const u8> input, u32 pitch, u
 }
 
 bool FastUnswizzleEnabled() {
-    static const bool enabled = std::getenv("EDEN_NX2_FAST_UNSWIZZLE") != nullptr;
+    static const bool enabled = [] { const char* v = std::getenv("EDEN_NX2_FAST_UNSWIZZLE"); return v == nullptr || v[0] != '0'; }();
     return enabled;
 }
 

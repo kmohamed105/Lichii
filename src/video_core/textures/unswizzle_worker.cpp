@@ -80,7 +80,7 @@ bool UnswizzleWorker::TryUnswizzle(std::span<u8> output, std::span<const u8> inp
                                    bool native_tiling, bool verify, Common::ThreadWorker* workers) {
     const size_t pitch = size_t{width} * bytes_per_pixel;
     const size_t host_bytes = pitch * height;
-    static const bool fast = std::getenv("EDEN_NX2_FAST_UNSWIZZLE") != nullptr;
+    static const bool fast = [] { const char* v = std::getenv("EDEN_NX2_FAST_UNSWIZZLE"); return v == nullptr || v[0] != '0'; }();
     if (fast) {
         return TryUnswizzleBands(output, input, bytes_per_pixel, width, height, depth,
                                  block_height, block_depth, stride_alignment, native_tiling,

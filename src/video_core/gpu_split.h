@@ -275,7 +275,7 @@ public:
     /// full wait for the back (~34% of the front thread); its compute work does not write the
     /// report pages. With EDEN_NX2_DMA_SNAPSHOT=10 every read is checked against a drained one.
     static inline const bool ignore_compute_writers =
-        std::getenv("EDEN_NX2_SNAPSHOT_IGNORE_COMPUTE") != nullptr;
+        [] { const char* v = std::getenv("EDEN_NX2_SNAPSHOT_IGNORE_COMPUTE"); return v == nullptr || v[0] != '0'; }();
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
@@ -639,7 +639,7 @@ private:
     // 2D and uploads note ranges). other_index: writes of unknown contents other than reports.
     static constexpr u32 WriteIndexBits = 20;
     static constexpr u64 WriteIndexHugePages = 1024; ///< Larger writes count for every page
-    static inline const bool write_index_enabled = std::getenv("EDEN_NX2_WRITE_INDEX") != nullptr;
+    static inline const bool write_index_enabled = [] { const char* v = std::getenv("EDEN_NX2_WRITE_INDEX"); return v == nullptr || v[0] != '0'; }();
     std::vector<u64> write_index = std::vector<u64>(size_t{1} << WriteIndexBits);
     std::vector<u64> other_index = std::vector<u64>(size_t{1} << WriteIndexBits);
     u64 huge_write_position{};

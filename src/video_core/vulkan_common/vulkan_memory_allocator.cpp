@@ -249,6 +249,9 @@ VkDeviceSize RecycleCap() {
     static const VkDeviceSize cap = [] {
         const char* const value = std::getenv("EDEN_NX2_RECYCLE_IMAGES");
         if (value == nullptr) {
+            return VkDeviceSize{1024} << 20; // On by default
+        }
+        if (value[0] == '0') {
             return VkDeviceSize{0};
         }
         long long mib = std::atoll(value);

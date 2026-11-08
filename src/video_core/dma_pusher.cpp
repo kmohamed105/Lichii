@@ -640,7 +640,7 @@ void DmaPusher::WatchArgument(u32 method, u32 argument) const {
 
 namespace {
 bool RangedCopies() {
-    static const bool enabled = std::getenv("EDEN_NX2_RANGED_COPIES") != nullptr;
+    static const bool enabled = [] { const char* v = std::getenv("EDEN_NX2_RANGED_COPIES"); return v == nullptr || v[0] != '0'; }();
     return enabled;
 }
 
@@ -822,7 +822,7 @@ void DmaPusher::NoteUploadWrites(u32 subchannel, u32 method) {
 }
 
 bool Ranged2D() {
-    static const bool enabled = std::getenv("EDEN_NX2_RANGED_2D") != nullptr;
+    static const bool enabled = [] { const char* v = std::getenv("EDEN_NX2_RANGED_2D"); return v == nullptr || v[0] != '0'; }();
     return enabled;
 }
 

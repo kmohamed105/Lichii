@@ -851,6 +851,9 @@ VkDeviceSize Device::RenderTargetPoolBlockSize() {
     static const VkDeviceSize size = [] {
         const char* value = std::getenv("EDEN_NX2_RT_POOL");
         if (value == nullptr) {
+            return VkDeviceSize{128} << 20; // On by default
+        }
+        if (value[0] == '0') {
             return VkDeviceSize{0};
         }
         const long mib = std::atol(value);

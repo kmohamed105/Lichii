@@ -275,7 +275,7 @@ public:
     static bool Enabled() {
         static const bool enabled = [] {
             const char* setting = std::getenv("EDEN_NX2_ACQUIRE_LEARN");
-            return setting != nullptr && setting[0] == '1';
+            return setting == nullptr || setting[0] == '1'; // On by default (=0 turns it off)
         }();
         return enabled;
     }
