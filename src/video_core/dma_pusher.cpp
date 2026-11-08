@@ -756,6 +756,138 @@ void DmaPusher::NoteCopyWrites(u32 subchannel) {
     }
 }
 
+bool RangedUploads() {
+    static const bool enabled = std::getenv("EDEN_NX2_RANGED_UPLOADS") != nullptr;
+    return enabled;
+}
+
+void DmaPusher::NoteUploadWrites(u32 subchannel, u32 method) {
+    // KeplerMemory: upload registers at 0x60 (Upload::Registers), exec 0x6C, data 0x6D.
+    constexpr u32 Exec = 0x6C;
+    constexpr u32 Data = 0x6D;
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (method != Exec && method != Data) {
+        return; // Setup registers write no memory
+    }
+    const auto& regs = upload_front_regs[subchannel];
+    const u64 line_length = regs[0x60];
+    const u64 lines = (std::max)(regs[0x61], 1U);
+    const GPUVAddr address = (GPUVAddr{regs[0x62] & 0xff} << 32) | regs[0x63];
+    const u32 exec = regs[Exec];
+    const bool linear = (exec & 1) != 0;
+    u64 size = 0;
+    if (linear) {
+        const u64 pitch = (std::max<u64>)(regs[0x64], line_length);
+        size = pitch * (lines - 1) + line_length;
+    } else {
+        const u32 block = regs[0x65];
+        const u32 width_log2 = block & 0xf;
+        const u32 height_log2 = (block >> 4) & 0xf;
+        const u32 depth_log2 = (block >> 8) & 0xf;
+        if (width_log2 <= 5 && height_log2 <= 5 && depth_log2 <= 5) {
+            const u64 row_unit = u64{64} << width_log2;
+            const u64 rows_unit = u64{8} << height_log2;
+            const u64 depth_unit = u64{1} << depth_log2;
+            const u64 width = (std::max<u64>)(regs[0x66], line_length);
+            const u64 height = (std::max<u64>)(regs[0x67], lines);
+            const u64 depth = (std::max)(regs[0x68], 1U);
+            size = (width + row_unit - 1) / row_unit * row_unit *
+                   ((height + rows_unit - 1) / rows_unit * rows_unit) *
+                   ((depth + depth_unit - 1) / depth_unit * depth_unit) * (u64{regs[0x69]} + 1);
+        }
+    }
+    const bool release = ((exec >> 4) & 3) == 2;
+    const GPUVAddr begin = address & ~GPUVAddr{0x1ff};
+    const u64 end = (address + size + 0x1ff) & ~u64{0x1ff};
+    std::optional<DAddr> first;
+    std::optional<DAddr> last;
+    if (!release && size != 0 && size <= (u64{64} << 20)) {
+        first = memory_manager.GpuToCpuAddress(begin);
+        last = memory_manager.GpuToCpuAddress(end - 1);
+    }
+    static std::array<u64, 2> outcomes{}; // ranged, unranged
+    if (first && last && *last == *first + (end - begin) - 1) {
+        split.NoteMemoryWriter();
+        split.NoteMemoryWrite(*first, end - begin, "inline upload");
+        ++outcomes[0];
+    } else {
+        split.NoteUnrangedWriter();
+        ++outcomes[1];
+    }
+    static auto last_log = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now(); now - last_log >= std::chrono::seconds{5}) {
+        last_log = now;
+        LOG_INFO(HW_GPU, "Ranged uploads: {} ranged, {} any range", outcomes[0], outcomes[1]);
+    }
+}
+
+bool Ranged2D() {
+    static const bool enabled = std::getenv("EDEN_NX2_RANGED_2D") != nullptr;
+    return enabled;
+}
+
+void DmaPusher::NoteBlitWrites(u32 subchannel, u32 method) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    const auto* const engine = subchannels[subchannel];
+    const bool trigger = engine != nullptr && method < engine->execution_mask.size() &&
+                         engine->execution_mask[method];
+    // Fermi2D: dst surface 0x80-0x89, src 0x8C-..., clip/rop/pattern up to 0x15F, render_solid
+    // 0x160-0x1FF and pixels_from_cpu 0x200-0x21B draw into dst, pixels_from_memory 0x220-...
+    // whose last register launches the blit (the execution mask).
+    const bool draws = trigger || (method >= 0x160 && method < 0x220);
+    const bool setup = !draws && ((method >= 0x80 && method < 0x160) || method >= 0x220);
+    static std::array<u64, 3> outcomes{}; // nothing, ranged, any range
+    if (setup) {
+        ++outcomes[0];
+        return;
+    }
+    bool ranged = false;
+    if (draws) {
+        const auto& regs = blit_front_regs[subchannel];
+        const bool linear = regs[0x81] != 0;
+        const u32 block = regs[0x82];
+        const u64 depth = (std::max)(regs[0x83], 1U);
+        const u64 layer = regs[0x84];
+        const u64 pitch = regs[0x85];
+        const u64 width = regs[0x86];
+        const u64 height = regs[0x87];
+        const GPUVAddr address = (GPUVAddr{regs[0x88] & 0xff} << 32) | regs[0x89];
+        u64 size = 0;
+        // Bytes per pixel are not decoded here: assume the largest format (16).
+        if (linear) {
+            size = (std::max<u64>)(pitch, width * 16) * height;
+        } else if ((block & 0xf) <= 5 && ((block >> 4) & 0xf) <= 5 && ((block >> 8) & 0xf) <= 5) {
+            const u64 row_unit = u64{64} << (block & 0xf);
+            const u64 rows_unit = u64{8} << ((block >> 4) & 0xf);
+            const u64 depth_unit = u64{1} << ((block >> 8) & 0xf);
+            size = (width * 16 + row_unit - 1) / row_unit * row_unit *
+                   ((height + rows_unit - 1) / rows_unit * rows_unit) *
+                   ((depth + depth_unit - 1) / depth_unit * depth_unit) * (layer + 1);
+        }
+        const GPUVAddr begin = address & ~GPUVAddr{0x1ff};
+        const u64 end = (address + size + 0x1ff) & ~u64{0x1ff};
+        if (size != 0 && size <= (u64{256} << 20)) {
+            const auto first = memory_manager.GpuToCpuAddress(begin);
+            const auto last = memory_manager.GpuToCpuAddress(end - 1);
+            if (first && last && *last == *first + (end - begin) - 1) {
+                split.NoteMemoryWriter();
+                split.NoteMemoryWrite(*first, end - begin, "2D");
+                ranged = true;
+            }
+        }
+    }
+    if (!ranged) {
+        split.NoteUnrangedWriter();
+    }
+    ++outcomes[ranged ? 1 : 2];
+    static auto last_log = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now(); now - last_log >= std::chrono::seconds{5}) {
+        last_log = now;
+        LOG_INFO(HW_GPU, "Ranged 2D: {} setup (nothing written), {} ranged, {} any range",
+                 outcomes[0], outcomes[1], outcomes[2]);
+    }
+}
+
 bool DmaPusher::WantsSegment() const {
     // Only macro parameters and compute uploads read the engine's current_dma_segment.
     const auto engine = subchannel_type[dma_state.subchannel];
@@ -797,11 +929,25 @@ void DmaPusher::CallMethod(u32 argument) {
         if (copy_ranged && dma_state.method < CopyFrontRegs) {
             copy_front_regs[dma_state.subchannel][dma_state.method] = argument;
         }
+        const bool upload_ranged = split.Active() && RangedUploads() &&
+                                   engine_type == Engines::EngineTypes::KeplerMemory;
+        if (upload_ranged && dma_state.method < UploadFrontRegs) {
+            upload_front_regs[dma_state.subchannel][dma_state.method] = argument;
+        }
+        const bool blit_ranged = split.Active() && Ranged2D() &&
+                                 engine_type == Engines::EngineTypes::Fermi2D;
+        if (blit_ranged && dma_state.method < BlitFrontRegs) {
+            blit_front_regs[dma_state.subchannel][dma_state.method] = argument;
+        }
         SCOPE_EXIT {
             if (writer && copy_ranged) {
                 NoteCopyWrites(dma_state.subchannel);
             } else if (writer) {
                 split.NoteWriter(engine_type == Engines::EngineTypes::MaxwellDMA);
+            } else if (memory_writer && upload_ranged) {
+                NoteUploadWrites(dma_state.subchannel, dma_state.method);
+            } else if (memory_writer && blit_ranged) {
+                NoteBlitWrites(dma_state.subchannel, dma_state.method);
             } else if (memory_writer) {
                 split.NoteUnrangedWriter();
             }
@@ -878,11 +1024,46 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                 }
             }
         }
+        const bool upload_ranged = split.Active() && RangedUploads() &&
+                                   engine_type == Engines::EngineTypes::KeplerMemory;
+        if (upload_ranged) {
+            for (u32 i = 0; i < num_methods; ++i) {
+                const u32 method = dma_state.method + (dma_state.non_incrementing ? 0 : i);
+                if (method < UploadFrontRegs && method != 0x6D) {
+                    upload_front_regs[dma_state.subchannel][method] = base_start[i];
+                }
+            }
+        }
+        const bool blit_ranged = split.Active() && Ranged2D() &&
+                                 engine_type == Engines::EngineTypes::Fermi2D;
+        if (blit_ranged) {
+            for (u32 i = 0; i < num_methods; ++i) {
+                const u32 method = dma_state.method + (dma_state.non_incrementing ? 0 : i);
+                if (method < BlitFrontRegs) {
+                    blit_front_regs[dma_state.subchannel][method] = base_start[i];
+                }
+            }
+        }
         SCOPE_EXIT {
             if (writer && copy_ranged) {
                 NoteCopyWrites(dma_state.subchannel);
             } else if (writer) {
                 split.NoteWriter(engine_type == Engines::EngineTypes::MaxwellDMA);
+            } else if (memory_writer && upload_ranged) {
+                const u32 last_method =
+                    dma_state.method + (dma_state.non_incrementing ? 0 : num_methods - 1);
+                for (u32 method = dma_state.method; method <= last_method; ++method) {
+                    if (method == 0x6C || method == 0x6D) {
+                        NoteUploadWrites(dma_state.subchannel, method);
+                        break;
+                    }
+                }
+            } else if (memory_writer && blit_ranged) {
+                const u32 last_method =
+                    dma_state.method + (dma_state.non_incrementing ? 0 : num_methods - 1);
+                for (u32 method = dma_state.method; method <= last_method; ++method) {
+                    NoteBlitWrites(dma_state.subchannel, method);
+                }
             } else if (memory_writer) {
                 split.NoteUnrangedWriter();
             }

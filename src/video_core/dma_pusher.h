@@ -294,6 +294,18 @@ public:
     std::array<std::array<u32, CopyFrontRegs>, max_subchannels> copy_front_regs{};
     /// Notes what a copy engine launch writes (ranged when the registers tell, else any range).
     void NoteCopyWrites(u32 subchannel);
+    /// EDEN_NX2_RANGED_UPLOADS: the front's copy of each inline-to-memory engine's registers.
+    static constexpr u32 UploadFrontRegs = 0x80;
+    std::array<std::array<u32, UploadFrontRegs>, max_subchannels> upload_front_regs{};
+    /// Notes what an inline-to-memory method writes: nothing for setup registers, the upload's
+    /// destination for its launch and data words (else any range).
+    void NoteUploadWrites(u32 subchannel, u32 method);
+    /// EDEN_NX2_RANGED_2D: the front's copy of each 2D engine's destination surface registers.
+    static constexpr u32 BlitFrontRegs = 0x90;
+    std::array<std::array<u32, BlitFrontRegs>, max_subchannels> blit_front_regs{};
+    /// Notes what a 2D engine method writes: nothing for setup registers, the destination surface
+    /// for blits, solid fills and pixels from the CPU, else any range.
+    void NoteBlitWrites(u32 subchannel, u32 method);
 
     Engines::Puller puller;
     std::mutex sync_mutex;
