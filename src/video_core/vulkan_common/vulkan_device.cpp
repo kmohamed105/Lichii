@@ -847,6 +847,18 @@ Device::~Device() {
     vmaDestroyAllocator(allocator);
 }
 
+VkDeviceSize Device::RenderTargetPoolBlockSize() {
+    static const VkDeviceSize size = [] {
+        const char* value = std::getenv("EDEN_NX2_RT_POOL");
+        if (value == nullptr) {
+            return VkDeviceSize{0};
+        }
+        const long mib = std::atol(value);
+        return VkDeviceSize{static_cast<u64>(mib >= 16 ? mib : 128)} << 20;
+    }();
+    return size;
+}
+
 VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
     std::scoped_lock lk{separate_pools_mutex};
     VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
@@ -854,7 +866,8 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::RenderTargets ? RenderTargetPoolBlockSize()
+                                                             : SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
             .priority = 0.f,

@@ -232,8 +232,38 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     // unbacked sparse fallback below.
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > (u64{1} << 28);
-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    // EDEN_NX2_RT_POOL: render targets go to a pool of their own with large blocks. Over half a
+    // default block (8 MiB: a 2560x1440 RGBA16F target is ~30 MB) an image otherwise gets memory
+    // of its own, which the driver allocates, maps, unmaps and frees each time the texture cache
+    // creates and collects it (Ocarina of Time recreates its post-processing targets about every
+    // frame while the camera moves: ~5% of the GPU back thread in the driver). Pool blocks stay.
+    bool pooled = false;
+    constexpr VkImageUsageFlags attachment_usage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (!huge && !dedicated && Device::RenderTargetPoolBlockSize() != 0 &&
+        (ci.usage & attachment_usage) != 0 && ci.samples == VK_SAMPLE_COUNT_1_BIT &&
+        ci.imageType == VK_IMAGE_TYPE_2D && ci.mipLevels == 1 && ci.arrayLayers == 1) {
+        u32 memory_type{};
+        if (vmaFindMemoryTypeIndexForImageInfo(allocator, &ci, &alloc_ci, &memory_type) ==
+            VK_SUCCESS) {
+            if (const VmaPool pool =
+                    device.GetSeparatePool(Device::SeparatePool::RenderTargets, memory_type)) {
+                VmaAllocationCreateInfo pool_ci = alloc_ci;
+                pool_ci.pool = pool;
+                pooled = vmaCreateImage(allocator, &ci, &pool_ci, &handle, &allocation,
+                                        &alloc_info) == VK_SUCCESS;
+                static bool logged_pool{};
+                if (pooled && !logged_pool) {
+                    logged_pool = true;
+                    LOG_INFO(Render_Vulkan, "Render targets use their own pool ({} MiB blocks)",
+                             Device::RenderTargetPoolBlockSize() >> 20);
+                }
+            }
+        }
+    }
+    VkResult result = pooled ? VK_SUCCESS
+                      : huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                             : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
