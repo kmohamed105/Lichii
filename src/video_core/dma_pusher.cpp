@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -637,6 +638,124 @@ void DmaPusher::WatchArgument(u32 method, u32 argument) const {
     }
 }
 
+namespace {
+bool RangedCopies() {
+    static const bool enabled = std::getenv("EDEN_NX2_RANGED_COPIES") != nullptr;
+    return enabled;
+}
+
+struct CopyRange {
+    GPUVAddr begin;
+    u64 size;
+};
+
+/// The GPU range a MaxwellDMA launch may write (generously rounded), from its registers, or
+/// nothing when they do not tell (MaxwellDMA::Launch: 1D copies and clears, multi-line copies to
+/// pitch or block linear destinations).
+std::optional<CopyRange> CopyDestination(std::span<const u32> regs) {
+    const u32 launch = regs[0xC0];
+    const bool multi_line = ((launch >> 9) & 1) != 0;
+    const bool remap = ((launch >> 10) & 1) != 0;
+    const bool dst_pitch = ((launch >> 8) & 1) != 0;
+    const GPUVAddr out = (GPUVAddr{regs[0x102] & 0xff} << 32) | regs[0x103];
+    const s32 pitch_out = static_cast<s32>(regs[0x105]);
+    const u64 length = regs[0x106];
+    const u64 lines = regs[0x107];
+    const u32 components = regs[0x1C2];
+    const u64 element = remap ? u64{((components >> 16) & 3) + 1} * (((components >> 24) & 3) + 1)
+                              : 1;
+    u64 begin = out;
+    u64 end = 0;
+    if (!multi_line) {
+        // 1D: bytes (or remapped elements); block linear kinds permute bits 4-8 of addresses.
+        end = out + length * 16;
+    } else if (dst_pitch) {
+        if (pitch_out < 0 || lines == 0) {
+            return std::nullopt;
+        }
+        end = out + static_cast<u64>(pitch_out) * (lines - 1) + length * element;
+    } else {
+        const u32 block = regs[0x1C3];
+        const u32 width_log2 = block & 0xf;
+        const u32 height_log2 = (block >> 4) & 0xf;
+        const u32 depth_log2 = (block >> 8) & 0xf;
+        if (width_log2 > 5 || height_log2 > 5 || depth_log2 > 5) {
+            return std::nullopt;
+        }
+        const u64 width = regs[0x1C4];
+        const u64 height = regs[0x1C5];
+        const u64 depth = (std::max)(regs[0x1C6], 1U);
+        const u64 layer = regs[0x1C7];
+        const u64 row_unit = u64{64} << width_log2;
+        const u64 rows_unit = u64{8} << height_log2;
+        const u64 depth_unit = u64{1} << depth_log2;
+        const u64 bytes_x = (width * element + row_unit - 1) / row_unit * row_unit;
+        const u64 rows = (height + rows_unit - 1) / rows_unit * rows_unit;
+        const u64 slices = (depth + depth_unit - 1) / depth_unit * depth_unit;
+        end = out + bytes_x * rows * slices * (layer + 1);
+    }
+    begin &= ~u64{0x1ff};
+    end = (end + 0x1ff) & ~u64{0x1ff};
+    if (end <= begin || end - begin > (u64{256} << 20)) {
+        return std::nullopt;
+    }
+    return CopyRange{begin, end - begin};
+}
+} // Anonymous namespace
+
+void DmaPusher::NoteCopyWrites(u32 subchannel) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    const auto& regs = copy_front_regs[subchannel];
+    const auto note = [&](GPUVAddr begin, u64 size, const char* what) {
+        const auto first = memory_manager.GpuToCpuAddress(begin);
+        const auto last = memory_manager.GpuToCpuAddress(begin + size - 1);
+        if (!first || !last || *last != *first + size - 1) {
+            return false;
+        }
+        split.NoteMemoryWrite(*first, size, what);
+        return true;
+    };
+    // Launches without a data transfer (data_transfer_type NONE: a semaphore release alone, half
+    // of Ocarina of Time's) write only the semaphore.
+    const bool transfers = (regs[0xC0] & 3) != 0;
+    const auto range = transfers ? CopyDestination(regs) : std::optional<CopyRange>{CopyRange{}};
+    bool ranged = range && (!transfers || note(range->begin, range->size, "copy"));
+    // The launch's semaphore release (one or four words) or reduction.
+    const bool semaphore_failed = ranged && ((regs[0xC0] >> 3) & 3) != 0 &&
+                                  !note((GPUVAddr{regs[0x90] & 0xff} << 32) | regs[0x91], 16,
+                                        "copy semaphore");
+    ranged = ranged && !semaphore_failed;
+    static std::array<u64, 4> outcomes{}; // ranged, no range, not contiguous, semaphore
+    ++outcomes[ranged ? 0 : !range ? 1 : semaphore_failed ? 3 : 2];
+    static std::array<u32, 4> examples{};
+    const size_t outcome = ranged ? 0 : !range ? 1 : semaphore_failed ? 3 : 2;
+    if (!ranged && examples[outcome] < 8) {
+        ++examples[outcome];
+        LOG_INFO(HW_GPU,
+                 "Ranged copies: launch {:#x} out {:#x} pitch {} length {} lines {} remap {:#x} "
+                 "dst block {:#x} {}x{}x{} layer {} semaphore {:#x} -> {}",
+                 regs[0xC0], (GPUVAddr{regs[0x102] & 0xff} << 32) | regs[0x103], regs[0x105],
+                 regs[0x106], regs[0x107], regs[0x1C2], regs[0x1C3], regs[0x1C4], regs[0x1C5],
+                 regs[0x1C6], regs[0x1C7], (GPUVAddr{regs[0x90] & 0xff} << 32) | regs[0x91],
+                 !range ? "no range" : semaphore_failed ? "semaphore not contiguous"
+                                                        : "not contiguous");
+    }
+    static auto last_log = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now(); now - last_log >= std::chrono::seconds{5}) {
+        last_log = now;
+        LOG_INFO(HW_GPU,
+                 "Ranged copies: {} ranged, {} without a range, {} not contiguous, {} semaphore "
+                 "not contiguous",
+                 outcomes[0], outcomes[1], outcomes[2], outcomes[3]);
+    }
+    if (ranged) {
+        split.NoteWriter(false);
+        split.NoteMemoryWriter();
+    } else {
+        split.NoteWriter(true);
+    }
+}
+
 bool DmaPusher::WantsSegment() const {
     // Only macro parameters and compute uploads read the engine's current_dma_segment.
     const auto engine = subchannel_type[dma_state.subchannel];
@@ -673,8 +792,15 @@ void DmaPusher::CallMethod(u32 argument) {
         const bool memory_writer = split.Active() &&
                                    (engine_type == Engines::EngineTypes::KeplerMemory ||
                                     engine_type == Engines::EngineTypes::Fermi2D);
+        const bool copy_ranged = split.Active() && RangedCopies() &&
+                                 engine_type == Engines::EngineTypes::MaxwellDMA;
+        if (copy_ranged && dma_state.method < CopyFrontRegs) {
+            copy_front_regs[dma_state.subchannel][dma_state.method] = argument;
+        }
         SCOPE_EXIT {
-            if (writer) {
+            if (writer && copy_ranged) {
+                NoteCopyWrites(dma_state.subchannel);
+            } else if (writer) {
                 split.NoteWriter(engine_type == Engines::EngineTypes::MaxwellDMA);
             } else if (memory_writer) {
                 split.NoteUnrangedWriter();
@@ -742,8 +868,20 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         const bool memory_writer = split.Active() &&
                                    (engine_type == Engines::EngineTypes::KeplerMemory ||
                                     engine_type == Engines::EngineTypes::Fermi2D);
+        const bool copy_ranged = split.Active() && RangedCopies() &&
+                                 engine_type == Engines::EngineTypes::MaxwellDMA;
+        if (copy_ranged) {
+            for (u32 i = 0; i < num_methods; ++i) {
+                const u32 method = dma_state.method + (dma_state.non_incrementing ? 0 : i);
+                if (method < CopyFrontRegs) {
+                    copy_front_regs[dma_state.subchannel][method] = base_start[i];
+                }
+            }
+        }
         SCOPE_EXIT {
-            if (writer) {
+            if (writer && copy_ranged) {
+                NoteCopyWrites(dma_state.subchannel);
+            } else if (writer) {
                 split.NoteWriter(engine_type == Engines::EngineTypes::MaxwellDMA);
             } else if (memory_writer) {
                 split.NoteUnrangedWriter();

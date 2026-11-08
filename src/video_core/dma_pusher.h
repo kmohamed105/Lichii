@@ -288,6 +288,12 @@ public:
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
+    /// EDEN_NX2_RANGED_COPIES: the front's copy of each copy engine's registers up to the
+    /// destination parameters, for the range a launch writes.
+    static constexpr u32 CopyFrontRegs = 0x200;
+    std::array<std::array<u32, CopyFrontRegs>, max_subchannels> copy_front_regs{};
+    /// Notes what a copy engine launch writes (ranged when the registers tell, else any range).
+    void NoteCopyWrites(u32 subchannel);
 
     Engines::Puller puller;
     std::mutex sync_mutex;
