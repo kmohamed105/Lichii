@@ -323,6 +323,57 @@ public:
         }
         return remembered == pending_writes.size();
     }
+    /// What ends a snapshot for [begin, begin + size) after `since` (diagnostics): "compute",
+    /// "copy", "unranged", the first overlapping noted write's label, "forgotten" or "none".
+    [[nodiscard]] const char* SnapshotBlocker(u64 since, u64 begin, u64 size) const {
+        if (last_copy_position > since) {
+            return "copy";
+        }
+        if (!ignore_compute_writers && last_writer_position > since) {
+            return "compute";
+        }
+        if (last_unranged_position > since) {
+            return "unranged";
+        }
+        const u64 end = begin + size;
+        const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+        for (u64 scanned = 0; scanned < remembered; ++scanned) {
+            const PendingWrite& write =
+                pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+            if (write.position <= since) {
+                return "none";
+            }
+            if (write.begin < end && begin < write.end) {
+                return write.what != nullptr ? write.what : "unlabelled";
+            }
+        }
+        return remembered == pending_writes.size() ? "forgotten" : "none";
+    }
+    /// EDEN_NX2_STALE_REPORT_READS: whether the only work sent after `since` that may write
+    /// [begin, begin + size) is 3D reports (occlusion queries and the like): then a macro DMA read
+    /// can return what memory holds now, the result of an earlier frame, without waiting for the
+    /// back, as "asynchronous queries" do elsewhere. Objects may show or hide a frame late.
+    [[nodiscard]] bool OnlyReportsWrittenSince(u64 since, u64 begin, u64 size) const {
+        const u64 writer_position =
+            ignore_compute_writers ? last_copy_position : last_writer_position;
+        if (writer_position > since || last_unranged_position > since) {
+            return false;
+        }
+        const u64 end = begin + size;
+        const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+        for (u64 scanned = 0; scanned < remembered; ++scanned) {
+            const PendingWrite& write =
+                pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+            if (write.position <= since) {
+                return true;
+            }
+            if (write.begin < end && begin < write.end &&
+                (write.what == nullptr || std::strcmp(write.what, "3D report") != 0)) {
+                return false;
+            }
+        }
+        return remembered != pending_writes.size();
+    }
     /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
     /// report, a semaphore release). size ~0 means an unknown range.
     void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {

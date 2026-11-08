@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -1853,6 +1854,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             static u64 differences{};
             static u64 report_reads{};
             static std::array<u64, 4> miss_reasons{};
+            static u64 stale_reads{};
+            static std::map<std::string, u64> blockers; ///< What ended the snapshot of a miss
+            static const bool stale_reports = std::getenv("EDEN_NX2_STALE_REPORT_READS") != nullptr;
             const u64 first_page = *device >> 12;
             const u64 last_page = (*device + read_bytes - 1) >> 12;
             bool hit = true;
@@ -1860,7 +1864,14 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 const auto it = fs.dma_snapshots.find(page);
                 hit = it != fs.dma_snapshots.end() &&
                       !split.MayBeWrittenSince(it->second, *device, read_bytes);
-                if (!hit) {
+                if (!hit && it != fs.dma_snapshots.end() && stale_reports &&
+                    split.OnlyReportsWrittenSince(it->second, *device, read_bytes)) {
+                    hit = true;
+                    ++stale_reads;
+                } else if (!hit) {
+                    if (it != fs.dma_snapshots.end()) {
+                        ++blockers[split.SnapshotBlocker(it->second, *device, read_bytes)];
+                    }
                     // No snapshot, compute/copy sent since, unranged writer sent since, noted write.
                     const u32 reason = it == fs.dma_snapshots.end()                   ? 0
                                        : split.LastWriterPosition() > it->second   ? 1
@@ -1926,9 +1937,14 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     LOG_INFO(HW_GPU,
                              "DMA snapshot: {} reads skipped the drain, {} drained, {} differed, "
                              "{} reads of listed reports (drained path); misses: {} new page, {} "
-                             "compute/copy, {} unranged, {} noted write",
+                             "compute/copy, {} unranged, {} noted write; {} stale report reads",
                              hits, misses, differences, report_reads, miss_reasons[0],
-                             miss_reasons[1], miss_reasons[2], miss_reasons[3]);
+                             miss_reasons[1], miss_reasons[2], miss_reasons[3], stale_reads);
+                    std::string text;
+                    for (const auto& [what, count] : blockers) {
+                        text += fmt::format(" {}={}", what, count);
+                    }
+                    LOG_INFO(HW_GPU, "DMA snapshot misses by what ended the snapshot:{}", text);
                 }
                 for (u32 i = 0; i < words; ++i) {
                     fs.parameters.push_back(snap_words[i]);
