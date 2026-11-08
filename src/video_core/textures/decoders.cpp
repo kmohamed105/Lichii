@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 
@@ -182,12 +183,80 @@ void Swizzle(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixe
     }
 }
 
+// EDEN_NX2_FAST_UNSWIZZLE: block linear to linear for single-slice images whose rows are a
+// multiple of 16 bytes, a GOB at a time. A GOB (64 bytes x 8 rows) is 32 runs of 16 contiguous
+// bytes whose places in it (native tiling included, it only swaps runs) come from a table, so
+// the per-16-byte address arithmetic of SwizzleImpl becomes a lookup.
+struct GobRunTable {
+    std::array<u16, 32> offsets; ///< Of the run at row r, column c (16 bytes) at index r * 4 + c
+};
+
+constexpr GobRunTable MakeGobRunTable(bool native_tiling) {
+    GobRunTable table{};
+    for (u32 row = 0; row < GOB_SIZE_Y; ++row) {
+        for (u32 column = 0; column < 4; ++column) {
+            const u32 offset = pdep<SWIZZLE_X_BITS>(column * 16) | pdep<SWIZZLE_Y_BITS>(row);
+            table.offsets[row * 4 + column] = static_cast<u16>(NativeGobOffset(offset, native_tiling));
+        }
+    }
+    return table;
+}
+
+constexpr GobRunTable plain_gob_runs = MakeGobRunTable(false);
+constexpr GobRunTable native_gob_runs = MakeGobRunTable(true);
+
+void UnswizzleGobs(std::span<u8> output, std::span<const u8> input, u32 pitch, u32 height,
+                   u32 block_height, u32 stride, bool native_tiling) {
+    const GobRunTable& table = native_tiling ? native_gob_runs : plain_gob_runs;
+    const u32 gobs_in_x = Common::DivCeilLog2(stride, GOB_SIZE_X_SHIFT);
+    const u32 block_size = gobs_in_x << (GOB_SIZE_SHIFT + block_height);
+    const u32 block_height_mask = (1U << block_height) - 1;
+    const u32 x_shift = GOB_SIZE_SHIFT + block_height;
+    const u32 full_gobs = pitch / GOB_SIZE_X;
+    const u32 tail_runs = (pitch % GOB_SIZE_X) / 16;
+    const u8* const in = input.data();
+    u8* const out = output.data();
+    const u32 gob_rows = Common::DivCeilLog2(height, GOB_SIZE_Y_SHIFT);
+    for (u32 gob_y = 0; gob_y < gob_rows; ++gob_y) {
+        const u32 offset_y = (gob_y >> block_height) * block_size +
+                             ((gob_y & block_height_mask) << GOB_SIZE_SHIFT);
+        const u32 first_line = gob_y * GOB_SIZE_Y;
+        const u32 lines = (std::min)(GOB_SIZE_Y, height - first_line);
+        for (u32 gob_x = 0; gob_x <= full_gobs; ++gob_x) {
+            const u32 runs = gob_x < full_gobs ? 4 : tail_runs;
+            if (runs == 0) {
+                break;
+            }
+            const u8* const gob = in + offset_y + (gob_x << x_shift);
+            u8* const row_base = out + size_t{first_line} * pitch + gob_x * GOB_SIZE_X;
+            for (u32 line = 0; line < lines; ++line) {
+                u8* const dst = row_base + size_t{line} * pitch;
+                const u16* const run = &table.offsets[line * 4];
+                for (u32 column = 0; column < runs; ++column) {
+                    std::memcpy(dst + column * 16, gob + run[column], 16);
+                }
+            }
+        }
+    }
+}
+
+bool FastUnswizzleEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_FAST_UNSWIZZLE") != nullptr;
+    return enabled;
+}
+
 } // Anonymous namespace
 
 void UnswizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,
                       u32 width, u32 height, u32 depth, u32 block_height, u32 block_depth,
                       u32 stride_alignment, bool native_tiling) {
     const u32 stride = Common::AlignUpLog2(width, stride_alignment) * bytes_per_pixel;
+    if (depth == 1 && block_depth == 0 && ((width * bytes_per_pixel) & 15) == 0 &&
+        FastUnswizzleEnabled()) {
+        UnswizzleGobs(output, input, width * bytes_per_pixel, height, block_height, stride,
+                      native_tiling);
+        return;
+    }
     const u32 new_bpp = (std::min)(4U, static_cast<u32>(std::countr_zero(width * bytes_per_pixel)));
     width = (width * bytes_per_pixel) >> new_bpp;
     bytes_per_pixel = 1U << new_bpp;
