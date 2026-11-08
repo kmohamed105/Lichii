@@ -126,6 +126,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 gc_deletes{};
     u64 gc_costly_deletes{};
     u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
+    u64 gc_downloads_skipped{}; ///< EDEN_NX2_GC_NO_DOWNLOAD: GPU-written evictions not downloaded
+    u64 fresh_render_targets{}; ///< EDEN_NX2_RT_FRESH: new render targets not uploaded
+    u64 render_targets_created{};  ///< New images a render target binding created
+    u64 render_targets_uploaded{}; ///< ... of which loaded from guest memory
     u64 async_decodes_queued{};
     u64 images_created{};
     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
@@ -560,6 +564,8 @@ private:
     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
     /// skip the upload of a new target the clear overwrites whole.
     bool clearing_render_targets = false;
+    /// Set while FindRenderTargetView finds or creates the image a render target binds.
+    bool creating_render_target = false;
     bool is_rescaling = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;

@@ -159,7 +159,16 @@ void TextureCache<P>::RunGarbageCollector() {
         if (True(image.flags & ImageFlagBits::IsDecoding)) {
             return false;
         }
-        const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+        // EDEN_NX2_GC_NO_DOWNLOAD: evict GPU-written images without reading them back (each
+        // read-back waits for the GPU to go idle). Their data is lost: guest memory keeps what
+        // it held before.
+        static const bool no_download = std::getenv("EDEN_NX2_GC_NO_DOWNLOAD") != nullptr;
+        const bool downloadable =
+            IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+        const bool must_download = downloadable && !no_download;
+        if (downloadable && no_download) {
+            ++gc_downloads_skipped;
+        }
         if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
             (!high_priority_mode && must_download)) {
             return false;
@@ -432,6 +441,9 @@ void TextureCache<P>::TickFrame() {
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} new render targets ({} uploaded, {} not uploaded), {} evictions not downloaded",
+                 render_targets_created, render_targets_uploaded, fresh_render_targets, gc_downloads_skipped);
+        fresh_render_targets = gc_downloads_skipped = render_targets_created = render_targets_uploaded = 0;
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
         astc_opaque_images = astc_alpha_images = 0;
         std::vector<std::pair<u32, u64>> shapes;
@@ -2763,11 +2775,43 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             return false;
         }
     };
+    // EDEN_NX2_RT_FRESH: a new render target is not loaded from guest memory either when nothing
+    // the cache holds overlaps it. Ocarina of Time places its post-processing targets at new
+    // addresses as the camera moves (~10 new targets a frame, ~0.5 GB/s uploaded); what guest
+    // memory holds there is stale (the GPU-written data lived in images since collected), and the
+    // passes draw the targets whole. The image starts undefined instead of stale.
+    // 1: only targets nothing overlaps. 2: also those overlapping older images (their data is
+    // copied in below, or lost to a bad overlap either way: the upload only brings stale memory).
+    const auto fresh_render_target = [&] {
+        static const int mode = [] {
+            const char* value = std::getenv("EDEN_NX2_RT_FRESH");
+            return value != nullptr ? std::atoi(value) : 0;
+        }();
+        if (mode == 0 || !creating_render_target || new_info.type != ImageType::e2D ||
+            new_info.resources.levels != 1 || new_info.resources.layers != 1 ||
+            new_info.num_samples != 1) {
+            return false;
+        }
+        return mode >= 2 || (join_copies_to_do.empty() && join_bad_overlap_ids.empty());
+    };
+    if (creating_render_target) {
+        ++render_targets_created;
+    }
     if (overwritten_by_clear()) {
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
         runtime.TransitionImageLayout(new_image);
+    } else if (fresh_render_target()) {
+        runtime.TransitionImageLayout(new_image);
+        new_image.flags &= ~ImageFlagBits::CpuModified;
+        if (False(new_image.flags & ImageFlagBits::Tracked)) {
+            TrackImage(new_image, new_image_id);
+        }
+        ++fresh_render_targets;
     } else {
+        if (creating_render_target && True(new_image.flags & ImageFlagBits::CpuModified)) {
+            ++render_targets_uploaded;
+        }
         // TODO: Only upload what we need
         RefreshContents(new_image, new_image_id);
     }
@@ -3063,11 +3107,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     }
     ImageId image_id{};
     bool delete_state = has_deleted_images;
+    creating_render_target = true;
     do {
         has_deleted_images = false;
         image_id = FindOrInsertImage(info, gpu_addr);
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
+    creating_render_target = false;
     has_deleted_images = delete_state;
     if (!image_id) {
         return NULL_IMAGE_VIEW_ID;
