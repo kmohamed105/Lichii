@@ -665,7 +665,16 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
             waiters.Add(this, *device, acquire.value, acquire.operation);
         }
-        ReleaseFences(dma_pusher);
+        // EDEN_NX2_ACQUIRE_ASYNC_FENCES: for a readable word, queue the fence release on the back
+        // instead of draining for it (~1.5k drains/s, ~270 ms/s of front waits in Ocarina of Time).
+        // A release that meets the value latches the waiter; if none has yet, the acquire
+        // suspends and the polls in CanResumeAcquire resume it without a drain.
+        static const bool async_fences = std::getenv("EDEN_NX2_ACQUIRE_ASYNC_FENCES") != nullptr;
+        if (async_fences && readable) {
+            OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+        } else {
+            ReleaseFences(dma_pusher);
+        }
         const bool met_now = readable
                                  ? (SemaphoreReadableNow(dma_pusher, acquire.address, word) &&
                                     acquire.Matches(word))
